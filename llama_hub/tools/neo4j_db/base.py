@@ -1,56 +1,16 @@
-from langchain.schema import (
-    SystemMessage,
-    HumanMessage,
-    AIMessage
-)
-from llama_index import Document
-from neo4j import GraphDatabase
-from neo4j.exceptions import CypherSyntaxError
-
-node_properties_query = """
-CALL apoc.meta.data()
-YIELD label, other, elementType, type, property
-WHERE NOT type = "RELATIONSHIP" AND elementType = "node"
-WITH label AS nodeLabels, collect(property) AS properties
-RETURN {labels: nodeLabels, properties: properties} AS output
-
-"""
-
-rel_properties_query = """
-CALL apoc.meta.data()
-YIELD label, other, elementType, type, property
-WHERE NOT type = "RELATIONSHIP" AND elementType = "relationship"
-WITH label AS nodeLabels, collect(property) AS properties
-RETURN {type: nodeLabels, properties: properties} AS output
-"""
-
-rel_query = """
-CALL apoc.meta.data()
-YIELD label, other, elementType, type, property
-WHERE type = "RELATIONSHIP" AND elementType = "node"
-RETURN {source: label, relationship: property, target: other} AS output
-"""
+from llama_index.graph_stores import Neo4jGraphStore
+from llama_index.llms.base import LLM, ChatMessage
+from llama_index.tools.tool_spec.base import BaseToolSpec
 
 
-def schema_text(node_props, rel_props, rels):
-    return f"""
-  This is the schema representation of the Neo4j database.
-  Node properties are the following:
-  {node_props}
-  Relationship properties are the following:
-  {rel_props}
-  Relationship point from source to target nodes
-  {rels}
-  Make sure to respect relationship types and directions
-  """
-
-
-class Neo4jQueryToolSpec:
+class Neo4jQueryToolSpec(BaseToolSpec):
     """
     This class is responsible for querying a Neo4j graph database based on a provided schema definition.
     """
 
-    def __init__(self, url, user, password, llm):
+    spec_functions = ["run_request"]
+
+    def __init__(self, url, user, password, database, llm: LLM):
         """
         Initializes the Neo4jSchemaWiseQuery object.
 
@@ -60,25 +20,16 @@ class Neo4jQueryToolSpec:
             password (str): Password for the Neo4j database.
             llm (obj): A language model for generating Cypher queries.
         """
-        self.driver = GraphDatabase.driver(url, auth=(user, password))
-        # construct schema
-        self.schema = self.generate_schema()
+        try:
+            from neo4j import GraphDatabase
+
+        except ImportError:
+            raise ImportError(
+                "`neo4j` package not found, please run `pip install neo4j`"
+            )
+
+        self.graph_store = Neo4jGraphStore(url=url, username=user, password=password, database=database)
         self.llm = llm
-
-    def generate_schema(self):
-        """
-        Generates a schema based on the Neo4j database.
-
-        Returns:
-            str: The generated schema.
-        """
-        node_props = self.query_graph_db(node_properties_query)
-        rel_props = self.query_graph_db(rel_properties_query)
-        rels = self.query_graph_db(rel_query)
-        return schema_text(node_props, rel_props, rels)
-
-    def refresh_schema(self):
-        self.schema = self.generate_schema()
 
     def get_system_message(self):
         """
@@ -94,7 +45,7 @@ class Neo4jQueryToolSpec:
         Do not use any other relationship types or properties that are not provided.
         If you cannot generate a Cypher statement based on the provided schema, explain the reason to the user.
         Schema:
-        {self.schema}
+        {self.graph_store.schema}
 
         Note: Do not include any explanations or apologies in your responses.
         """
@@ -112,28 +63,10 @@ class Neo4jQueryToolSpec:
         """
         if params is None:
             params = {}
-        with self.driver.session() as session:
+        with self.graph_store.client.session() as session:
             result = session.run(neo4j_query, params)
             output = [r.values() for r in result]
             output.insert(0, list(result.keys()))
-            return output
-
-    def query_graph_db_as_document(self, neo4j_query, params=None):
-        """
-        Queries the Neo4j database.
-
-        Args:
-            neo4j_query (str): The Cypher query to be executed.
-            params (dict, optional): Parameters for the Cypher query. Defaults to None.
-
-        Returns:
-            list: The query results.
-        """
-        if params is None:
-            params = {}
-        with self.driver.session() as session:
-            result = session.run(neo4j_query, params)
-            output = [Document(text="\n".join([f"{key}:{val}" for key, val in zip(r.keys(), r.values())])) for r in result]
             return output
 
     def construct_cypher_query(self, question, history=None):
@@ -148,17 +81,17 @@ class Neo4jQueryToolSpec:
             str: The constructed Cypher query.
         """
         messages = [
-            SystemMessage(content=self.get_system_message()),
-            HumanMessage(content=question),
+            ChatMessage(role='system', content=self.get_system_message()),
+            ChatMessage(role='user', content=question),
         ]
         # Used for Cypher healing flows
         if history:
             messages.extend(history)
 
-        completions = self.llm(messages)
-        return completions.content
+        completions = self.llm.chat(messages)
+        return completions.message.content
 
-    def run(self, question, history=None, retry=True):
+    def run_request(self, question, history=None, retry=True):
         """
         Executes a Cypher query based on a given question.
 
@@ -170,11 +103,13 @@ class Neo4jQueryToolSpec:
         Returns:
             list/str: The query results or an error message.
         """
+        from neo4j.exceptions import CypherSyntaxError
+
         # Construct Cypher statement
         cypher = self.construct_cypher_query(question, history)
         print(cypher)
         try:
-            return self.query_graph_db_as_document(cypher)
+            return self.query_graph_db(cypher)
         # Self-healing flow
         except CypherSyntaxError as e:
             # If out of retries
@@ -183,12 +118,12 @@ class Neo4jQueryToolSpec:
             # Self-healing Cypher flow by
             # providing specific error to GPT-4
             print("Retrying")
-            return self.run(
+            return self.run_request(
                 question,
                 [
-                    AIMessage(content=cypher),
-                    SystemMessage(conent=f"""This query returns an error: {str(e)} 
-                        Give me a improved query that works without any explanations or apologies"""),
+                    ChatMessage(role='assistant', content=cypher),
+                    ChatMessage(role='system', conent=f"This query returns an error: {str(e)}\n"
+                                                      "Give me a improved query that works without any explanations or apologies"),
                 ],
                 retry=False
             )
